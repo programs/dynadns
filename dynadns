@@ -1,0 +1,349 @@
+#!/bin/bash
+
+#
+# dynadns v0.1.0
+# 基于DNSPOD-API构架的bash dynamic dns客户端
+# 作    者：ljjun (wisbyme@yahoo.com) 
+# 创建日期：2013-02-01
+#
+# Configuration for DNSPOD.(API版本-4.5)说明：
+#
+# 1、关于滥用：
+#    以下这些，但并不限于以下这些行为都被视为滥用：
+#      a.短时间内大量添加、删除、修改、刷新域名或者记录，或者设置记录状态。
+#      b.记录内容没有任何改变的刷新，比如动态DNS中IP没变也请求修改记录。
+#      c.其它没有提到的，但会给系统带来压力的请求行为。
+# 2、禁止登录：
+#    如果账号尝试登录错误次数在5分钟内超过30次则会被禁止登录一个小时，写程序的时候特别是动态
+#    客户端的时候必须判断是否登录成功，如果不成功必须马上停止尝试。如果使用动态客户端，在网页上
+#    修改了密码后务必到客户端修改，否则将不可用。
+# 3、关于封禁：
+#    由于滥用API将会导致账号在API中封禁，但并不影响在官方网站上的使用，封禁一定的时间后会自
+#    动解除，一般需要一个小时后才会解封，所以请小心操作，不要拿API进行大量测试。
+# 4、请求地址：
+#    请求的地址为 https://dnsapi.cn/ 开头的地址，基于SSL安全传输。为了安全必须用https开头
+#    的地址，否则将有可能被封禁。
+# 5、请求方法：
+#    只支持POST方法请求数据，用其它方法会提示相关错误。
+# 6、关于编码：
+#    请用UTF-8编码进行数据传输，返回的数据也是UTF-8编码的。
+# 7、关于UserAgent:
+#    请求的时候必须设置UserAgent，如果不设置或者设置为不合法的（比如设置为浏览器的）也会导致
+#    账号被封禁API。
+#    UserAgent的格式必须为：程序英文名称/版本 (联系邮箱)
+#    比如：LJJ DDNS Client/1.0.0 (email@126.com)
+# 8、关于安全：
+#    用户需要输入用户邮箱和密码才能进行下一步的操作，如果需要在客户端上或数据库中保存用户的信息，
+#    必须加密后保存，不得明文保存在文件中。
+# 9、D令牌验证相关:
+#    由于D令牌的随机码每30秒变换一次，所以建议用户在第一次请求API的时候选择记住验证码。选择记
+#    住验证码后，除了返回所请求的数据以外，还会发一个名为't' + user_id 的cookie，形如：t123456，该
+#    cookie的有效期为1个月，以后再请求API可以带上这个cookie，而无须再提交login_code和
+#    login_remember参数。
+# A、技术支持：
+#    请登录论坛 http://discussdns.com/forum-45-1.html 提问。
+#
+
+login_email=${1:?'必须提供登录名'}
+login_password=${2:?'必须提供密码'}
+format="json"
+lang="en"
+userAgent="ljjun dynadns client/0.1.0(wisbyme@yahoo.com)"
+commonPost="login_email=$login_email&login_password=$login_password&format=$format&lang=$lang"
+
+apiUrl='https://dnsapi.cn/'
+ipUrl='http://ddns.oray.com/checkip'
+#ipUrl='http://members.3322.org/dyndns/getip'
+#ipUrl='http://myip.sinaapp.com/'
+
+# 要处理的域名数组，每个元素代表一个域名的一组记录
+# 在数组的一个元素中，以空格分隔域名和子域名
+# 第一个空格前为主域名，后面用空格分离多个子域名
+# 如果使用泛域名，必须用\*转义
+# domainList[0]='domain1.com \* @ www'
+# domainList[1]='domain2.com subdomain subdomain2'
+# domainList[0]='ljjun.com \* www'
+domainList[0]='ljjun.com home'
+
+# 多长时间比较一次ip地址(秒)
+delay=300
+
+# logfile
+logDir='/usr/local/bin/log'
+logFile=$logDir'/dnspod.log'
+traceFile=$logDir'/dnspod_trace.log'
+
+function writeLog()
+{
+	if [ -w $logDir ];then
+		local pre=`date`
+		for arg in $@;do
+			pre=$pre' '$arg
+		done
+		echo -e $pre>>$logFile
+	fi
+	echo -e $1
+}
+
+
+# 检测ip地址是否符合要求
+function checkip()
+{
+	# ipv4地址
+	if [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]];then
+		return 0
+	# ipv6地址
+	elif [[ "$1" =~ ^([\da-fA-F]{1,4}:){7}[\da-fA-F]{1,4}$|^:((:[\da-fA-F]{1,4}){1,6}|:)$|^[\da-fA-F]{1,4}:((:[\da-fA-F]{1,4}){1,5}|:)$|^([\da-fA-F]{1,4}:){2}((:[\da-fA-F]{1,4}){1,4}|:)$|^([\da-fA-F]{1,4}:){3}((:[\da-fA-F]{1,4}){1,3}|:)$|^([\da-fA-F]{1,4}:){4}((:[\da-fA-F]{1,4}){1,2}|:)$|^([\da-fA-F]{1,4}:){5}:([\da-fA-F]{1,4})?$|^([\da-fA-F]{1,4}:){6}:$ ]];then
+		return 0
+	fi
+	return 1
+}
+
+function getUrl()
+{
+	#curl -s -A $userAgent -d $commonPost$2 --trace $traceFile $apiUrl$1
+	 curl -s -A $userAgent -d $commonPost$2 $apiUrl$1
+         #writeLog "curl -s -A $userAgent -d $commonPost$2 $apiUrl$1"
+}
+
+function getVersion()
+{
+	getUrl "Info.Version"
+}
+
+function getUserDetail()
+{
+	getUrl "User.Detail"
+}
+
+function getDomainList()
+{
+	getUrl "Domain.List" "&type=all&offset=0&length=10"
+}
+
+# 根据域名id获取记录列表
+# $1 域名id
+function getRecordList()
+{
+	getUrl "Record.List" "&domain_id=$1&offset=0&length=20"
+}
+
+# 设置记录
+function setRecord()
+{
+	writeLog "set domain [$3.$8] to new ip:$7"
+	local subDomain=$3
+	# 由于*会被扩展，在最后一步将转义的\*替换成*
+	if [ "$subDomain" = '\*' ];then
+		subDomain='*'
+	fi
+	local request="&domain_id=$1&record_id=$2&sub_domain=$subDomain&record_type=$4&record_line=$5&ttl=$6&value=$7"
+	#echo $request
+
+	local saveResult=$(getUrl 'Record.Modify' "$request")
+        #writeLog "\n\t$request\n\t$saveResult\n"
+
+	# 检测返回是否正常，但即使不正常也不退出程序
+	if ! (checkStatusCode "$saveResult" 0);then
+		writeLog "set record [$3.$8] fail."
+        else
+                writeLog "set record [$3.$8] success."
+	fi
+	#getUrl 'Record.Modify' "&domain_id=$domainid&record_id=$recordid&sub_domain=$recordName&record_type=$recordtype&record_line=$recordline&ttl=$recordttl&value=$newip"
+}
+
+# 设置一批记录
+function setRecords()
+{
+	numRecord=${#changedRecords[@]}
+	for (( i=0; i < $numRecord; i++ ));do
+		setRecord ${changedRecords[$i]}
+	done
+	# 删除待处理的变量
+	unset changeRecords
+}
+
+# 通过key得到找到一个JSON对象字符串中的值
+function getDataByKey()
+{
+	local s='s/{[^}]*"'$2'":["]*\('$(getRegexp $2)'\)["]*[^}]*}/\1/'
+	#echo '拼合成的regexp:'$s
+	echo $1|sed $s
+}
+
+# 根据key返回要获取的正则表达式
+function getRegexp()
+{
+	case $1 in
+		'value') echo '[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}';;
+		'type') echo '[A-Z]\+';;
+		'name') echo '[-_.A-Za-z*]\+';;
+		'ttl'|'id') echo '[0-9]\+';;
+		'line') echo '[^"]\+';;
+	esac
+}
+
+# 通过一个JSON key名称，获取一个{}包围的JSON对象字符串
+# $1 要搜索的key名称
+# $2 要搜索的对应值
+function getJSONObjByKey()
+{
+	grep -o '{[^}{]*"'$1'":"'$2'"[^}]*}'
+}
+
+# 获取A记录类型的域名信息
+# 对于其它记录，同样的名称可以对应多条记录，因此使用getJSONObjByKey可能获取不到需要的数据
+function getJSONObjByARecord()
+{
+	grep -o '{[^}{]*"name":"'$1'"[^}]*"type":"A"[^}]*}'
+}
+
+# 获取返回代码是否正确
+# $1 要检测的字符串，该字符串包含{status:{code:1}}形式，代表DNSPodAPI返回正确
+# $2 是否要停止程序，因为dnspod在代码错误过多的情况下会封禁账号
+function checkStatusCode()
+{
+	if [[ "$1" =~ \{\"status\":\{[^}{]*\"code\":\"1\"[^}]*\} ]];then
+		return 0
+	fi
+	writeLog "DNSPOD return error:\n\n\t$1\n"
+	# 根据参数需求退出程序
+	if [ -n "$2" ] && [ "$2" -eq 1 ];then
+		writeLog 'exit dnspod'
+		exit 1
+		#writeLog 'try to continue dnspod'
+		#return 0
+	fi
+}
+
+# 获取与当前ip不同的，要更新的记录的数组
+function getChangedRecords()
+{
+	# 从DNSPod获取最新的域名列表
+	local domainListInfo=$(getDomainList)
+	if [ -z "$domainListInfo" ];then
+		writeLog 'DNSPOD tell me domain list is null,waiting...'
+		return 1
+	fi
+	checkStatusCode "$domainListInfo" 1
+
+	# 主域名的id
+	local domainid
+	local domainName
+	# 主域名的JSON信息
+	local domainInfo
+	# 主域名的所有记录列表
+	local recordList
+	# 一条记录的JSON信息
+	local recordInfo
+	# 记录的id
+	local recordid
+	local recordName
+	# 记录的TTL
+	local recordTtl
+	# 记录的类型
+	local recordType
+	# 记录的线路
+	local recordLine
+	local j
+
+	# 用于记录被改变的记录
+	unset changedRecords
+
+	local numDomain=${#domainList[@]}
+	local domainGroup
+
+	for ((i=0;i<$numDomain;i++));do
+		domainGroup=${domainList[$i]}
+		j=0
+		for domain in ${domainGroup[@]};do
+			# 列表的第一个项目，是主域名
+			if ((j==0));then
+				domainName=$domain
+				domainInfo=$(echo $domainListInfo|getJSONObjByKey 'name' $domainName) 
+				domainid=$(getDataByKey "$domainInfo" 'id')
+				recordList=$(getRecordList $domainid)
+                                
+                                #writeLog "\n\n\t$domainName\n\t$domainInfo\n\t$domainid\n"
+                                #writeLog "\t$recordList\n\n"
+
+				if [ -z "$recordList" ];then
+					writeLog 'DNSPOD tell me record list null,waiting...'
+					return 1
+				fi
+				checkStatusCode "$recordList" 1
+			else
+				# 从dnspod获取要设置的子域名记录的信息
+				recordInfo=$(echo $recordList|getJSONObjByARecord $domain)
+
+				# 如果取不到记录，则不处理
+				if [ -z "$recordInfo" ];then
+					continue
+				fi
+
+				# 从dnspod获取要设置的子域名的ip
+				oldip=$(getDataByKey "$recordInfo" 'value')
+
+                                #writeLog "\n\t$recordInfo\n"
+
+				# 检测获取到的旧ip地址是否符合ip规则
+				if ! checkip "$oldip";then
+					writeLog 'get old ip error!it is "$oldid".waiting...'
+					continue
+				fi
+
+				if [ "$newip" != "$oldip" ];then
+
+					recordid=$(getDataByKey "$recordInfo" 'id')
+					recordName=$(getDataByKey "$recordInfo" 'name')
+					recordTtl=$(getDataByKey "$recordInfo" 'ttl')
+					recordType=$(getDataByKey "$recordInfo" 'type')
+					# 由于从服务器获取的线路是utf编码，目前无法知道如何转换成中文，因此在这里写死。dnspod中免费用户的默认线路的名称就是“默认”
+					#recordLine=$(getDataByKey "$recordInfo" 'line')
+					#recordLine='默认'
+                                        recordLine=$(echo -e '\u9ED8\u8BA4' | python /usr/local/bin/chgutf8.py)
+
+                                        #writeLog "\n\t$recordid\n\t$recordName\n\t$recordTtl\n\t$recordType\n\t$recordLine\n"
+
+					# 判断取值是否正常，如果值为空就不处理
+					if [ -n "$recordid" ] && [ -n "$recordTtl" ] && [ -n "$recordType" ]; then
+						# 使用数组记录需要修改的子域名的所有值
+						# 这里一共有8个参数，与setRecord中的参数对应
+						changedRecords[${#changedRecords[@]}]="$domainid $recordid $domain $recordType $recordLine $recordTtl $newip $domainName"
+                                                #writeLog "\n\t$changeRecords[${#changedRecords[@]}]\n"
+					fi
+				fi
+			fi
+			j=$((j+1))
+		done
+	done
+}
+
+# 执行检测工作
+function go()
+{
+	# 由于获取到的数据多了一些多余的字符，所以提取ip地址的部分
+	# 从api中获取当前的外网ip
+	newip=$(curl -s $ipUrl|grep -o $(getRegexp 'value'))
+	# 如果获取最新ip错误，就继续等待下一次取值
+	if ! checkip "$newip";then
+		writeLog 'can not get new ip,waiting...'
+		sleep $delay
+		continue
+	fi
+
+	#writeLog '||>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>'
+
+	# 获取需要修改的记录
+	getChangedRecords
+	if (( ${#changedRecords[@]} > 0 ));then
+		writeLog "ip is changed,new ip is:$newip"
+		setRecords
+	fi
+}
+
+chmod 777 $logDir
+while [ 1 ];do
+	go
+	sleep $delay
+done
